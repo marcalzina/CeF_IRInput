@@ -1,16 +1,21 @@
 #ifndef INCLUDEGUARD_Cef_IRInput_h
 #define INCLUDEGUARD_Cef_IRInput_h
+// Arduino Cef_IRInput library by Marc Alzina. See README.md for more details.
 
 #include <Arduino.h>
 
 namespace Cef_IRInput
 {
-  struct ParamsLowRes
+
+  struct ParamsLowRes // This struct is to be used as a template parameter for TimingsBuffer
   {
+    // used by TimingsBuffer
     typedef uint8_t Ticks;
     static inline Ticks microsToTicks( uint32_t m ) { return 16320<=m ? 255 : (m+32)/64; }
     static inline uint32_t ticksToMicros( Ticks t ) { return t*64; }
 
+    // used by decodeOrClear and NEC_Decoder
+    static inline uint32_t timeoutMicros() { return 16000; }
     static inline Ticks microsToTicksUnsafe( uint32_t m ) { return (m+32)/64; }
     static inline bool match( Ticks const observed, uint32_t const expected )
     { // we convert expected instead of observed because it is known at compile time and can be optimised
@@ -18,18 +23,27 @@ namespace Cef_IRInput
     }
   };
 
-  struct ParamsHighRes
+  struct ParamsHighRes // This struct is to be used as a template parameter for TimingsBuffer
   {
+    // used by TimingsBuffer
     typedef uint16_t Ticks;
     static inline Ticks microsToTicks( uint32_t m ) { return min( m, 65535 ); }
     static inline uint32_t ticksToMicros( Ticks t ) { return t; };
 
+    // used by decodeOrClear and NEC_Decoder
+    static inline uint32_t timeoutMicros() { return 16000; }
     static bool match( Ticks const observed, uint32_t const expected )
     { // we convert expected instead of observed because it is known at compile time and can be optimised
       return (expected*3)/4 <= observed && observed <= (expected*5)/4;
     }
   };
 
+  // TimingsBuffer is class implementing a circular buffer that stores the duration between state changes.
+  // In order to save memory, the precision with which these durations are stored can be configured
+  // using the Param class passed as a template parameter. In order to keep track of the current
+  // state of the signal during two transitions, we always store the time during which the signal
+  // was HIGH in odd buffer offsets (and conversely LOW/even), see nextWriteIsForHigh() and
+  // nextReadIsForHigh().
   template< uint16_t bufferSize=128 /* must be a power of 2 */, typename Params_T=ParamsLowRes >
   class TimingsBuffer
   {
@@ -164,8 +178,8 @@ namespace Cef_IRInput
   public:
     enum EnumType { Empty, NotEnoughData, ParseError, NEC_Code, NEC_Repeat };
     EnumType enumValue;
-    uint16_t length; // if NotEnoughData, =min nb of entries - if ParseError, = location of error - otherwise, nb of entries used to decode
-    uint32_t numValue;
+    uint16_t length; // if NotEnoughData, =min nb of entries; if ParseError, = location of error; otherwise, nb of entries that the decoded value was made of
+    uint32_t numValue; // the numerical data, i.e. the code that represents the key pressed on the remote
 
     inline DecodedValue() : enumValue(Empty) {}
     inline DecodedValue( EnumType ev, uint16_t length ) : enumValue(ev), length(length) {}
@@ -188,81 +202,76 @@ namespace Cef_IRInput
     void dump() const
     {
       Serial.print( enumToString() );
-      Serial.print( ", length=" );
-      Serial.print( length );
-      if( isDecoded() )
+      if( !isEmpty() )
       {
-        Serial.print( ", value=0x" );
-        Serial.println( numValue, HEX );
+        Serial.print( ", length=" );
+        Serial.print( length );
+        if( isDecoded() )
+        {
+          Serial.print( ", value=0x" );
+          Serial.print( numValue, HEX );
+        }
       }
-      else
-        Serial.println("");
+      Serial.println("");
     }
   };
-
-
-  class Reader
+  
+  // We assume that HIGH state in TB is "pulsed IR", and LOW is "no IR"
+  template<typename Decoder>
+  DecodedValue decodeOrClear( typename Decoder::TB& tb )
   {
-  public:
-    Reader() {}
-
-    static inline uint32_t timeoutMicros() { return 16000; }
-  // We assume that HIGH state in TB is pulsed IR, and LOW is no IR
-    template<typename Decoder>
-    DecodedValue read( typename Decoder::TB& tb )
+    noInterrupts();
+    uint32_t const durationSinceLastWrite = tb.getDurationSinceLastWrite();
+    uint16_t n = tb.size();
+    interrupts();
+    while( true )
     {
-      noInterrupts();
-      uint32_t const durationSinceLastWrite = tb.getDurationSinceLastWrite();
-      uint16_t n = tb.size();
-      interrupts();
-      while( true )
+      DecodedValue const dv = Decoder::decode( tb, n );
+      if( dv.isDecoded() )
       {
-        DecodedValue const dv = Decoder::decode( tb, n );
-        if( dv.isDecoded() )
+#ifdef Cef_IRInput_DEBUG
+        Serial.print("Parsed code: " );
+        tb.dump( dv.length );
+#endif
+        tb.consume( dv.length );
+        return dv;
+      }
+      if( dv.enumValue==DecodedValue::NotEnoughData && durationSinceLastWrite<Decoder::TB::Params::timeoutMicros() )
+        return dv;
+
+      // here we should have dv.enumValue==DecodedValue::ParseError or (DecodedValue::NotEnoughData and timeout)
+      // drop everything until the next long blank
+      typename Decoder::TB::Params::Ticks const minTicks = Decoder::TB::Params::microsToTicks( Decoder::TB::Params::timeoutMicros() );
+      {
+        uint16_t i = (tb.nextReadIsForHigh() ? 1 : 2); // check the durations of Low states only, and ignore the first Low state
+        for( ; true; i+=2 )
+        {
+          if( n<=i )
+          {
+            i=n;
+            break;
+          }
+          if ( minTicks <= tb.peek(i) )
+            break;
+        }
+        if( i )
         {
   #ifdef Cef_IRInput_DEBUG
-          Serial.print("Parsed code: " );
-          tb.dump( dv.length );
+          Serial.print("Decoder said: " );
+          dv.dump();
+          Serial.print("Dropped gibberish: " );
+          tb.dump( i );
   #endif
-          tb.consume( dv.length );
-          return dv;
+          tb.consume(i);
+          n -= i;
         }
-        if( dv.enumValue==DecodedValue::NotEnoughData && durationSinceLastWrite<timeoutMicros() )
+        else
           return dv;
-
-        // here we should have dv.enumValue==DecodedValue::ParseError or (DecodedValue::NotEnoughData and timeout)
-        // drop everything until the next long blank
-        typename Decoder::TB::Params::Ticks const minTicks = Decoder::TB::Params::microsToTicks( timeoutMicros() );
-        {
-          uint16_t i = (tb.nextReadIsForHigh() ? 1 : 2); // check the durations of Low states only, and ignore the first Low state
-          for( ; true; i+=2 )
-          {
-            if( n<=i )
-            {
-              i=n;
-              break;
-            }
-            if ( minTicks <= tb.peek(i) )
-              break;
-          }
-          if( i )
-          {
-    #ifdef Cef_IRInput_DEBUG
-            Serial.print("Decoder said: " );
-            dv.dump();
-            Serial.print("Dropped gibberish: " );
-            tb.dump( i );
-    #endif
-            tb.consume(i);
-            n -= i;
-          }
-          else
-            return dv;
-        }
       }
     }
-  };
+  }
 
+  // Decode the NEC IR Protocol
   template<typename TB_T /* TimingsBuffer */>
   struct NEC_Decoder
   {
@@ -318,7 +327,7 @@ namespace Cef_IRInput
 
         offset++;
       }
-      /*
+      /* some brands of remote use a distinctive duration for this last mark
       if( !isBitMark(b.peek(offset)) )
         return DecodedValue( DecodedValue::ParseError, offset );
       */
@@ -326,6 +335,14 @@ namespace Cef_IRInput
       return DecodedValue( DecodedValue::NEC_Code, offset, data );
     }
   };
+
+  // convenience function for the standard choice
+  typedef Cef_IRInput::TimingsBuffer < 128, Cef_IRInput::ParamsLowRes > StdIrBuffer;   
+  inline DecodedValue decodeOrClearNEC( StdIrBuffer& b )
+  {
+    return decodeOrClear<NEC_Decoder<StdIrBuffer> >( b );
+  }
+
 } // namespace Cef_IRInput
 
 #endif
